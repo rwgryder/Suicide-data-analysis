@@ -1,0 +1,367 @@
+---
+title: "Suicide Rates and Economic Quality"
+author: "Ryan Gryder"
+output: html_document
+---
+
+
+## Introduction
+
+In this project, we are interested in how economy quality as measured by Gross Domestic Product (GDP) is related to rate of suicide. An intuitive idea is that suicide rates should decrease as GDP increases since the latter reflects financial security. The goal of this work is to investigate if this is really true or if more nuanced and complicated relationships are occurring with regards to suicides. By accounting for the additional factors of age, sex, country, and time, we hope to shed some light on how/where future mental health efforts should be focused.   
+
+The data set was constructed by joining the following three data sets by country and year: 
+1. [United Nations Development Programme Annual Report 2018](https://www.undp.org/content/undp/en/home/librarypage/corporate/annual-report-2018.html)
+2. [World Bank National Accounts Data: GDP (current US$)](https://data.worldbank.org/indicator/NY.GDP.MKTP.CD)
+3. [World Health Organization: Suicide Prevention](https://www.who.int/health-topics/suicide#tab=tab_1) 
+
+One observation gives the number of suicides for a particular demographic (sex and age group) during a specific year in a specific country. The GDP (in US dollars) for each country and year combination is also available. Using the population size of each demographic group, we compute the number of suicides per 100,000 people, and this is our main working response variable. For continuous variables, we have year (1987-2018), number of suicides, population size, suicides per 100k people, and GDP. As for categorical variables, we have country (belonging to United Nations), sex, and age group (5-14, 15-24, 25-34, 35-54, 55-74, and 75 and up). There are a total of BLANK observations. An **SQL** database and *SQLite* connectivity in **R** is used for computational efficiency.    
+
+
+```{r connect to database}
+library(tidyverse)
+library(GGally)
+library(lme4)
+library(modelr)
+library(DBI)
+library(RSQLite)
+
+con <- dbConnect(SQLite(), dbname = "suicide.db") # connect to database using SQLite
+suic_db <- tbl(con, "table1") # database has single table of data
+
+suic_db <- suic_db %>% select(country, year, sex, age, suicides_no, population, suicides_100k, GDP) 
+
+# set age levels for plotting purposes
+suic_db$age <- factor(suic_db$age, levels = c('5-14 years', '15-24 years', '25-34 years',
+                                            '35-54 years', '55-74 years', '75+ years'))
+# a quick look at the data
+suic_db %>% print(n = 4)
+
+```
+
+## Exploratory Data Analysis
+
+First, we construct visualizations to explore general patterns and relations between the variables. Hopefully, some initial insights can be gleaned to guide the statistical modelling. We start with univariate histograms of the continuous variables. Since some demographics exhibited no suicides in a particular country and year, the distribution of the strictly non-zero suicide portion of the data is visualized. 
+
+
+```{r hists}
+# Histogram of suicides_100k
+suic_db %>% ggplot() + geom_histogram(aes(x = suicides_100k)) + xlab('Suicides per 100k people') + 
+  labs(title = 'Distribution of Suicides per 100k people') + ylab('Frequency')
+
+# Histogram of  suicides_100k > 0
+suic_db %>% filter(suicides_100k > 0) %>% ggplot() + geom_histogram(aes(x = suicides_100k)) + 
+  xlab('Non-zero Suicides per 100k people') + 
+  labs(title = 'Distribution of Suicides per 100k people - Excluding Zeros') + ylab('Frequency')
+  
+# Histogram of GDP
+suic_db %>% ggplot() + geom_histogram(aes(x = GDP)) + ylab('Frequency') + xlab('GDP') +
+  labs(title = 'Distribution of Country Gross Domestic Product')
+
+# Histogram of population size 
+suic_db %>% ggplot() + geom_histogram(aes(x =population)) + ylab('Frequency') + xlab('Population Size') +
+  labs(title = 'Distribution of Country Population Size')
+
+# This computes how much of the data consists of 0's for suicides_100k
+cat('The number of zero suicide observations: ', nrow(suic_db %>% filter(suicides_100k == 0) %>% collect()))
+
+cat('The proportion of zero suicide observations: ', nrow(suic_db %>% filter(suicides_100k == 0) %>% 
+                                                            collect())/nrow(suic_db %>% collect()))
+```
+The first histogram informs us that our response variable, suicides per 100,000 people, is heavily skewed to the right due to the presence of many zero and very small suicide proportions. In fact, about 15% of the observations are zeros. This suggests that it would be worthwhile to investigate the differences between the portion of the data representing zero suicides and the portion representing non-zero suicides. We will take this into account when building statistical models. After removing the sizeable chunk of zero suicide observations, the distribution of suicides per 100,000 people remains heavily skewed right; therefore, we will use a Generalized Linear Model (GLM) to model this response. The modelling specifics will be discussed later. GDP and demographic population size are also skewed right; much of the data is taken from small countries with low GDP.  
+
+Next, we construct some multivariate visualizations to explore the relationships between multiple variables and specifically how the number of suicides per 100,000 people varies across the other variable. We start by visualizing suicide proportions vs the categorical factors. 
+
+
+```{r boxplots}
+
+# For plotting purposes
+age_order <- c("5-14 years", "15-24 years", "25-34 years", "35-54 years", "55-74 years", "75+ years")
+
+# suicides_100k vs age
+suic_db %>% ggplot(aes(x = fct_relevel(age, age_order), y = suicides_100k)) + geom_boxplot() + xlab('Age') + 
+  ylab('Suicides per 100k people') + labs(title = 'Distribution of Suicides by Age Range')
+
+# suicides_100k vs sex
+suic_db %>% ggplot(aes(x = sex, y = suicides_100k)) + geom_boxplot() + xlab('Sex') + 
+  ylab('Suicides per 100k people') + labs(title = 'Distribution of Suicides by Sex')
+
+# suicides_100k vs age and sex
+suic_db %>% ggplot(aes(x = sex, y = suicides_100k)) + geom_boxplot() + facet_wrap(~ fct_relevel(age, age_order)) + xlab('Sex') + 
+  ylab('Suicides per 100k people') + labs(title = 'Distribution of Suicides by Sex and Age Range')
+
+
+```
+The first boxplot depicts an overall trend of increased suicide rates with age, although the pattern is not particularly sharp due to the suicide proportion outliers observed within every age group. A commonly accepted idea is that adults in their 20's and 30's commit the most suicides. While this may be true based on raw counts, the data here does not support this when taking the size of the age group into account. Here we see that the 75+ age group exhibits the highest median suicide rate. As for sex, we see a clear increase in suicide rates from females to males although large valued suicide rate outliers are present in both groups. When separating into all combinations of age and sex, we see that this difference between female and male suicide rates is more/less pronounced depending on the age group. The sex difference in suicide rates is the largest for the 35-54 age group, and in general the difference is more pronounced in the 25-75+ age range and not so apparent in the 5-24 age range.    
+
+Now we use scatter plots with overlayed smooth curves (computed with locally weighted polynomial regression) to visualize the relationship between suicide rates and year while accounting for the categorical variables. The values of suicides per 100,000 people are grouped and consolidated for ease of visualization.   
+
+
+```{r lines for year}
+
+# SQL queries are stored for potential future use. The multiple uses of 'sum()' is cumbersome, so we only fully compute it when we have to.  
+
+year_query <- suic_db %>% group_by(year) %>% summarise(suicides_prop = sum(suicides_no, na.rm = T)/sum(population, na.rm = T))
+
+year_sex_query <- suic_db %>% group_by(year, sex) %>% summarise(suicides_prop = sum(suicides_no, na.rm = T)/sum(population, na.rm = T))
+  
+year_age_query <- suic_db %>% group_by(year, age) %>% summarise(suicides_prop = sum(suicides_no, na.rm = T)/sum(population, na.rm = T))
+
+year_sex_age_query <- suic_db %>% group_by(year, sex, age) %>% summarise(suicides_prop = sum(suicides_no, na.rm = T)/sum(population, na.rm = T))
+
+# suicide rate vs year
+year_query %>% 
+  ggplot(aes(x = year, y = suicides_prop)) + geom_point() + geom_smooth() + xlab('Year') + ylab('Suicide Rate') +
+  labs(title = 'Suicide Rate by Year')
+
+# suicide rate vs year and sex
+year_sex_query %>%
+  ggplot(aes(x = year, y = suicides_prop)) + geom_point(aes(color = sex)) + geom_smooth(aes(color = sex), se = F) +
+  xlab('Year') + ylab('Suicide Rate') + labs(title = 'Suicide Rate by Year and Sex')
+
+# suicide rate vs year and age
+year_age_query %>%
+  ggplot(aes(x = year, y = suicides_prop)) + geom_point(aes(color = fct_relevel(age, age_order))) + geom_smooth(aes(color = age), se = F) +
+  xlab('Year') + ylab('Suicide Rate') + labs(title = 'Suicide Rate by Year and Age', color = 'Age')
+
+# suicide rate vs year, sex, and age
+year_sex_age_query %>%
+  ggplot(aes(x = year, y = suicides_prop)) + geom_point(aes(color = fct_relevel(age, age_order))) + geom_smooth(aes(color = age), se = F) + 
+  xlab('Year') + ylab('Suicide Rate') + labs(title = 'Suicide Rate by Year, Sex, and Age', color = 'Age') + facet_wrap(~ sex)
+
+
+```
+
+Without accounting for the other variables, there is an overall trend of suicide rates increasing up until around 1996 and 1997 then decreasing after this point in time. At the moment, we are not certain if there is a particular world event and/or global economic trend that is responsible for this observation, but it is interesting nonetheless and is a potential direction for future work. However, this rising and falling pattern of suicide rates over time disappears when localized to partiular age groups and sex. For females, suicide rate appears mostly constant with time with a slight decreases into the 2000's. The rising/falling pattern of suicide rates over time is only observed in the 25-74 age group. Suicide rates remain somewhat constant over time for those in the 5-24 age range while there is a sharp decrease in suicide rates with time for 75+ individuals. When taking sex and age into account simultaneously, the rising/falling pattern for suicide rates over time is mainly observed in males age 25-74. Another interesting observation is that there is a steep decrease in suicide rates over time for elderly males. A similar decrease is observed for elderly females, but it is not nearly as steep. 
+
+Before moving on to the statistical modelling, we construct similar scatter plots with overlayed smooth curves for suicide rates vs GDP while accounting for the categorical variables of sex and age.
+
+
+```{r lines for GDP}
+
+# SQL queries are stored for potential future use. The multiple uses of 'sum()' is cumbersome, so we only fully compute it when we have to. 
+
+gdp_query <- suic_db %>% filter(!is.na(GDP)) %>% group_by(GDP) %>% 
+  summarise(suicides_prop = sum(suicides_no, na.rm = T)/sum(population, na.rm = T))
+
+gdp_sex_query <- suic_db %>% filter(!is.na(GDP)) %>% group_by(GDP, sex) %>% 
+  summarise(suicides_prop = sum(suicides_no, na.rm = T)/sum(population, na.rm = T))
+
+gdp_age_query <- suic_db %>% filter(!is.na(GDP)) %>% group_by(GDP, age) %>% 
+  summarise(suicides_prop = sum(suicides_no, na.rm = T)/sum(population, na.rm = T))
+
+gdp_sex_age_query <- suic_db %>% filter(!is.na(GDP)) %>% group_by(GDP, sex, age) %>% 
+  summarise(suicides_prop = sum(suicides_no, na.rm = T)/sum(population, na.rm = T))
+
+# suicide rate vs GDP
+gdp_query %>%
+  ggplot(aes(x = GDP, y = suicides_prop)) + geom_point() + geom_smooth() + xlab('GDP') + ylab('Suicide Rate') +
+  labs(title = 'Suicide Rate vs GDP')
+
+# suicide rate vs GDP and sex
+gdp_sex_query %>%
+  ggplot(aes(x = GDP, y = suicides_prop)) + geom_point(aes(color = sex)) + geom_smooth(aes(color = sex), se = F) + 
+  xlab('GDP') + ylab('Suicide Rate') + labs(title = 'Suicide Rate vs GDP and Sex')
+
+# suicide rate vs GDP and age
+gdp_age_query %>%
+  ggplot(aes(x = GDP, y = suicides_prop)) + geom_point(aes(color = fct_relevel(age, age_order))) + geom_smooth(aes(color = age), se = F) + 
+  xlab('GDP') + ylab('Suicide Rate') + labs(title = 'Suicide Rate vs GDP and Age', color = 'Age')
+
+# suicide vs GDP, sex, and age
+gdp_sex_age_query %>%
+  ggplot(aes(x = GDP, y = suicides_prop)) + geom_point(aes(color = sex)) + geom_smooth(aes(color = sex), se = F) + 
+  xlab('GDP') + ylab('Suicide Rate') + labs(title = 'Suicide Rate vs GDP, Sex, and Age') + facet_wrap(~ fct_relevel(age, age_order))
+
+
+```
+The interesting thing about these plots is that if the smooth curves were absent, one would think that there is an overall trend of suicide rates decreasing with GDP where this decrease is initially sharp and then slows down. However, the smooth curves indicate that on average, suicide rates remain mostly constant with GDP with perhaps a slight decrease. This discrepancy in interpretation is due to the many observations of low AND high suicide rates for small values of GDP. Nonetheless, a distinct and interesting observation from these plots is that when an unusually high suicide rate is observed, it is often within a country with low GDP. This observation is more present for males aged 25-75+.  
+
+## Statistical Modelling
+
+Our initial visualizations revealed that the response, suicides per 100,000 people, is heavily skewed to the right due to the large amount of zero and small-valued number of suicides. In fact, about 15% of the data has a value of zero for the response. Due to the potential problems from fitting a model on a continuous response with a large amount of zeros, we will use a *two-stage hurdle model*. That is, we will first fit a model to classify the binary response of zero vs non-zero suicides per 100,00 people. Then we will fit a separate model to predict the continuous non-zero suicide rates. For the former, we will use *logistic regression* while for the latter, we will use *Gamma regression* sine the non-zero suicide rates are still heavily skewed right. This is an appropriate modelling procedure because the large amount of zero-valued responses are still included and taken into account but not in a way that raises computational issues. We also gain the advantage of being able to determine the features that distinguish the zero suicide rates from the non-zero suicide rates with respect to our independent variables of interest.  
+
+Each modelling stage will use the independent variables of sex, age, and GDP. We center and scale GDP to handle its own skewed nature. As for the effect of different countries, there are far too many levels to include it as a typical categorical variable. Also, there is reason to believe that there are overall patterns relating suicide rates to sex, age, and GDP that are similar across all countries. While countries might not individually provide distinct and identifiable effects on suicide rates, they might provide an additional source of variability of suicide rates. For this reason, we will fit *mixed effects models* to account for this additional source of variability introduced by the different countries. A mixed effets model is appropriate since we will treat country as a random effect while treating GDP, sex, and age as usual fixed effects. Specifically, we will fit a *random intercept model*. That is, the effect of each country is represented as a random change to the intercept of the model. For both the logistic and Gamma regression models, we will compare the model performance with and without the inclusion of country as a random effect. In the end, we will have fit *generalized linear mixed effects models*.  
+
+
+```{r logreg}
+binary_suic <- suic_db %>% collect() %>% 
+  mutate(suicides_yn = if_else(suicides_100k == 0,0,1), GDP_std = (GDP-mean(GDP))/sd(GDP))
+
+# scale GDP
+# take out time since it messed up models converging 
+# fixed effects
+LogisticReg_FixedEffects <- glm(suicides_yn ~ sex + age + GDP_std, data = binary_suic, family = binomial)
+
+# mixed effects: random effect for country 
+LogisticReg_MixedEffects <- glmer(suicides_yn ~ sex + age + GDP_std + 
+                             (1|country), data = binary_suic, family = binomial)
+
+summary(LogisticReg_FixedEffects)
+summary(LogisticReg_MixedEffects)
+
+# accuracy
+pred_randomCountry <- if_else(predict(LogisticReg_MixedEffects, type = 'response') >= 0.5,1,0)
+pred_fixed <- if_else(predict(LogisticReg_FixedEffects, type = 'response') >= 0.5,1,0)
+
+cat('Classification accuracy of fixed effects logistic regression: ', 
+    mean(pred_fixed == binary_suic$suicides_yn))
+cat('Classification accuracy of mixed effects logistic regression: ', 
+    mean(pred_randomCountry == binary_suic$suicides_yn))
+
+# fixed effect model classifies everything as 1!. Mixed effects does not. 
+
+```
+
+Takeaways from logistic regression models:
+- Significant predictors
+- Random effects model is preferred for prediction
+- Effect of including random effect for country on significance of predictors
+
+Now we visualize the classification performance.
+
+```{r logreg plots}
+
+logreg_predictions <- binary_suic %>% gather_predictions(LogisticReg_FixedEffects, LogisticReg_MixedEffects, type = 'response')
+
+logreg_predictions %>%
+    ggplot(aes(x = as.factor(suicides_yn), y = pred)) + geom_boxplot() + facet_wrap(~ model) +
+    xlab('Zero and Non-Zero Suicides') + ylab('Predicted Probability of Zero and Non-Zero Scuicides') +
+    labs(title = 'Classification of Zero and Non-Zero Suicides', 
+         subtitle = 'All Fixed Effects vs Random Effect for Country')
+
+logreg_predictions %>%
+    ggplot(aes(x = as.factor(suicides_yn), y = pred)) + geom_boxplot() + 
+    geom_point(aes(color = sex), alpha = 0.3, position = 'jitter') + facet_wrap(~ model) +
+    xlab('Zero and Non-Zero Suicides') + ylab('Predicted Probability of Zero and Non-Zero Scuicides') +
+    labs(title = 'Classification of Zero and Non-Zero Suicides - Differences in Sex', 
+         subtitle = 'All Fixed Effects vs Random Effect for Country')
+
+logreg_predictions %>%
+    ggplot(aes(x = as.factor(suicides_yn), y = pred)) + geom_boxplot() + 
+    geom_point(aes(color = fct_relevel(age, age_order)), alpha = 0.3, position = 'jitter') + facet_wrap(~ model) +
+    xlab('Zero and Non-Zero Suicides') + ylab('Predicted Probability of Zero and Non-Zero Scuicides') +
+    labs(title = 'Classification of Zero and Non-Zero Suicides - Differences in Age', 
+         subtitle = 'All Fixed Effects vs Random Effect for Country', color = 'Age')
+
+binary_suic %>% gather_predictions(LogisticReg_MixedEffects, type = 'response') %>%
+    ggplot(aes(x = GDP_std)) + geom_point(aes(y = suicides_yn)) + 
+    geom_smooth(aes(y = pred, color = sex)) + facet_wrap(~ fct_relevel(age, age_order)) +
+    xlab('Standardized GDP') + ylab('Predicted Probability of Zero and Non-Zero Scuicides') +
+    labs(title = 'Probability of Zero and Non-Zero Suicides vs GDP', 
+         subtitle = 'Differences in Sex and Age')
+
+
+```
+
+Takeaways from classification performance of logistic regression:
+
+
+
+Subsection: Prediction of Non-Zero Suicides per 100k people
+
+First we do some quick visualizations of the non-zero suicides per 100k people. 
+
+```{r EDA of positive suicides}
+
+#suic_db %>% filter(suicides_100k > 0) %>% ggplot() + geom_histogram(aes(x = suicides_100k)) + 
+#  xlab('Non-zero Suicides per 100k people') + ylab('Frequency') +
+#  labs(title = 'Distribution of Non-zero Suicides per 100k people')
+
+#suic_db %>% filter(suicides_100k > 0) %>% ggplot() + geom_histogram(aes(x = suicides_100k)) + facet_wrap(~ sex) +
+#  xlab('Non-zero Suicides per 100k people') + ylab('Frequency') +
+#  labs(title = 'Distribution of Non-zero Suicides per 100k people by Sex')
+
+#suic_db %>% filter(suicides_100k > 0) %>% ggplot() + geom_histogram(aes(x = suicides_100k)) + facet_wrap(~ fct_relevel(age, age_order)) +
+#  xlab('Non-zero Suicides per 100k people') + ylab('Frequency') +
+#  labs(title = 'Distribution of Non-zero Suicides per 100k people by Age')
+
+#suic_db %>% filter(suicides_100k > 0) %>% ggplot() + geom_histogram(aes(x = suicides_100k)) + facet_wrap(fct_relevel(age, age_order) ~ sex) +
+#  xlab('Non-zero Suicides per 100k people') + ylab('Frequency') +
+#  labs(title = 'Distribution of Non-zero Suicides per 100k people by Sex and Age')
+
+suic_db %>% filter(suicides_100k > 0) %>% ggplot(aes(x = GDP, y = suicides_100k)) + stat_binhex() +
+  xlab('GDP') + ylab('Non-zero Suicides per 100k people') +
+  labs(title = 'Non-zero Suicides per 100k People vs GDP')
+
+suic_db %>% filter(suicides_100k > 0) %>% ggplot(aes(x = GDP, y = suicides_100k)) + stat_binhex() + facet_wrap(~ sex) +
+  xlab('GDP') + ylab('Non-zero Suicides per 100k people') +
+  labs(title = 'Non-zero Suicides per 100k People vs GDP', subtitle = 'Differences in Sex')
+
+suic_db %>% filter(suicides_100k > 0) %>% ggplot(aes(x = GDP, y = suicides_100k)) + stat_binhex() + facet_wrap(~ fct_relevel(age, age_order)) +
+  xlab('GDP') + ylab('Non-zero Suicides per 100k people') +
+  labs(title = 'Non-zero Suicides per 100k People vs GDP', subtitle = 'Differences in Age')
+
+suic_db %>% filter(suicides_100k > 0) %>% ggplot(aes(x = GDP, y = suicides_100k)) + stat_binhex() + facet_wrap(fct_relevel(age, age_order) ~ sex) +
+  xlab('GDP') + ylab('Non-zero Suicides per 100k people') +
+  labs(title = 'Non-zero Suicides per 100k People vs GDP', subtitle = 'Differences in Sex and Age')
+
+```
+
+Takeaways from visualizations:
+
+Explain the modelling procedure and how it is informed by the plots. 
+
+```{r gammareg}
+
+positive_suic <- suic_db %>% filter(suicides_100k > 0) %>% collect() %>% mutate(GDP_std = (GDP-mean(GDP))/sd(GDP))
+ 
+GammaReg_FixedEffects <- glm(suicides_100k ~ sex + age + GDP_std, data = positive_suic, 
+                             family = Gamma(link = 'log'))
+
+GammaReg_MixedEffects <- glmer(suicides_100k ~ sex + age + GDP_std + (1|country), 
+                               data = positive_suic, family = Gamma(link = 'log'))
+
+summary(GammaReg_FixedEffects)
+summary(GammaReg_MixedEffects)
+
+# compare the two with Deviance residuals: cut in half!
+cat('Sum of squared Deviance residuals for fixed effects Gamma regression: ',
+    sum(resid(GammaReg_FixedEffects, type = 'deviance')^2))
+cat('Sum of squared Deviance residuals for mixed effects Gamma regression: ',
+    sum(resid(GammaReg_MixedEffects, type = 'deviance')^2))
+
+# residual plots
+ggplot() + 
+  geom_point(aes(x = fitted(GammaReg_FixedEffects), y = resid(GammaReg_FixedEffects, type='deviance')),
+             alpha = 0.3) + geom_hline(aes(yintercept = 0)) + xlab('Fitted Values') + 
+  ylab('Residuals') + labs(title = 'Residuals vs Fitted Values of Non-Zero Suicides per 100k people',
+                           subtitle = 'Gamma Regression with Fixed Effects')
+
+ggplot() + 
+  geom_point(aes(x = fitted(GammaReg_MixedEffects), y = resid(GammaReg_MixedEffects, type='deviance')),
+             alpha = 0.3) + geom_hline(aes(yintercept = 0)) + xlab('Fitted Values') + 
+  ylab('Residuals') + labs(title = 'Residuals vs Fitted Values of Non-Zero Suicides per 100k people',
+                           subtitle = 'Gamma Regression with Country Random Effect')
+
+```
+
+Takeaways from gamma regression models:
+- random effect is better in terms of deviance of residuals
+- look at residual plots: model appropriate?
+- significant predictors with and without random effect for country 
+
+Now we visualize the predictive performance:
+
+```{r gammareg plots}
+
+# plot pred curve vs GDP
+gammareg_pred_plot <- positive_suic %>% gather_predictions(GammaReg_MixedEffects, type = 'response') %>%
+    ggplot(aes(x = GDP_std)) + geom_point(aes(y = suicides_100k), alpha = 0.3) + 
+    geom_smooth(aes(y = pred, color = sex)) + facet_wrap(~ fct_relevel(age, age_order)) + xlab('Standardized GDP') +
+    ylab('Predicted Non-Zero Suicides per 100k people') +
+    labs(title = 'Non-Zero Suicides per 100k people vs GDP', 
+         subtitle = 'Differences in Sex and Age')
+
+gammareg_pred_plot
+gammareg_pred_plot + ylim(0,100)
+
+```
+
+Takeaways from predictive performance of gamma regression model:
+
+
+
+
+
+
+
